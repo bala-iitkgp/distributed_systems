@@ -432,6 +432,7 @@ func (cfg *config) checkOneLeader() int {
 		for i := 0; i < cfg.n; i++ {
 			if cfg.connected[i] {
 				if term, leader := cfg.rafts[i].GetState(); leader {
+					fmt.Println("Leader for term: ", term, " is: ", i)
 					leaders[term] = append(leaders[term], i)
 				}
 			}
@@ -581,10 +582,15 @@ func (cfg *config) one(cmd interface{}, expectedServers int, retry bool) int {
 			t1 := time.Now()
 			for time.Since(t1).Seconds() < 2 {
 				nd, cmd1 := cfg.nCommitted(index)
+				/*fmt.Println("Cfg Ncommitted outputs: ", nd, " ", cmd1)
+				fmt.Println("cmd: ", cmd, " cmd1: ",cmd1 )
+				fmt.Println("nd: ", nd, " expectedServers: ", expectedServers)*/
 				if nd > 0 && nd >= expectedServers {
+					//fmt.Println("cmd: ", cmd, " cmd1: ",cmd1 )
 					// committed
 					if cmd1 == cmd {
 						// and it was the command we submitted.
+						fmt.Println("index: ", index)
 						return index
 					}
 				}

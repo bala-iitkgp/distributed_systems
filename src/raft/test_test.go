@@ -8,6 +8,8 @@ package raft
 // test with the original before submitting.
 //
 
+//TODO: added many -1 to index!= -- to be changed after
+
 import "testing"
 import "fmt"
 import "time"
@@ -28,7 +30,7 @@ func TestInitialElection3A(t *testing.T) {
 
 	// is a leader elected?
 	cfg.checkOneLeader()
-
+	fmt.Println("One leader check is done")
 	// sleep a bit to avoid racing with followers learning of the
 	// election, then check that all peers agree on the term.
 	time.Sleep(50 * time.Millisecond)
@@ -138,7 +140,8 @@ func TestBasicAgree3B(t *testing.T) {
 		}
 
 		xindex := cfg.one(index*100, servers, false)
-		if xindex != index {
+		fmt.Println("xindex: ", xindex, " index: ", index)
+		if xindex != index  {
 			t.Fatalf("got index %v but expected %v", xindex, index)
 		}
 	}

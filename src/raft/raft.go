@@ -18,13 +18,15 @@ package raft
 //
 
 import (
-	//	"bytes"
+	"bytes"
 	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	//	"6.5840/labgob"
+	//"fmt"
+
+	"6.5840/labgob"
 	"6.5840/labrpc"
 )
 
@@ -50,6 +52,11 @@ type ApplyMsg struct {
 	SnapshotIndex int
 }
 
+type Logs struct{
+	Command interface{}
+	Term int
+}
+
 // A Go object implementing a single Raft peer.
 type Raft struct {
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
@@ -62,16 +69,41 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
+	currentTerm int
+	votedFor int
+	log []Logs
+	commitLength int
+
+	currentRole string
+	currentLeader int
+	votesReceived map[int]bool
+
+	sentLength []int
+	ackedLength []int
+
+	applyCh chan ApplyMsg
+
+	// declare a bool variable receivedMsg -> set to true when you receive a msg, check this
+	// before triggering an election and then set this to false
+	receivedMsg bool
 }
 
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
 
-	var term int
-	var isleader bool
+	var isLeader bool
 	// Your code here (3A).
-	return term, isleader
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	term := rf.currentTerm
+	if (rf.currentRole == "leader") {
+		isLeader = true
+	} else {
+		isLeader = false
+	}
+	
+	return term, isLeader
 }
 
 // save Raft's persistent state to stable storage,
@@ -90,6 +122,14 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// raftstate := w.Bytes()
 	// rf.persister.Save(raftstate, nil)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+	e.Encode(rf.commitLength)
+	raftstate := w.Bytes()
+	rf.persister.Save(raftstate, nil)
 }
 
 
@@ -111,6 +151,24 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var currentTerm int
+	var votedFor int
+	var log []Logs
+	var commitLength int
+	if (d.Decode(&currentTerm) != nil ||
+	   d.Decode(&votedFor) != nil ||
+	   d.Decode(&log) != nil ||
+	   d.Decode(&commitLength) != nil ) {
+		//fmt.Println("Decode Error!!")	
+	} else {
+		rf.currentTerm = currentTerm
+		rf.votedFor = votedFor
+		rf.log = log
+		rf.commitLength = commitLength
+	}
 }
 
 
@@ -128,17 +186,160 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 // field names must start with capital letters!
 type RequestVoteArgs struct {
 	// Your data here (3A, 3B).
+	CandidateId int
+	CandidateTerm int
+	//Below details are for 3B
+	CLogLength int
+	CLogTerm int
+	
 }
 
 // example RequestVote RPC reply structure.
 // field names must start with capital letters!
 type RequestVoteReply struct {
 	// Your data here (3A).
+	VoterId int
+	VCurrentTerm int
+	VoterResponse bool
 }
 
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (3A, 3B).
+	cId := args.CandidateId
+	cTerm := args.CandidateTerm
+	cLogLength := args.CLogLength
+	cLogTerm := args.CLogTerm
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if rf.currentTerm < cTerm {
+		rf.currentTerm = cTerm
+		rf.currentRole = "follower"
+		// remove any votedFor in previous terms
+		rf.votedFor = -1
+		rf.persist()
+	}
+
+	lastTerm := 0
+	if(len(rf.log) > 0) {
+		lastTerm = rf.log[len(rf.log)-1].Term
+	}
+
+	logOk := (cLogTerm > lastTerm ) || (cLogTerm == lastTerm && cLogLength >= len(rf.log))
+	if cTerm == rf.currentTerm && logOk && (rf.votedFor == -1 || rf.votedFor == cId) {
+		rf.votedFor = cId
+		rf.persist()
+		reply.VoterResponse = true
+	} else {
+		reply.VoterResponse = false
+	}
+	reply.VoterId = rf.me
+	reply.VCurrentTerm = rf.currentTerm
+
+	return
+
+}
+
+type AppendEntriesArgs struct {
+	LeaderId int
+	LeaderTerm int
+	PrefixLength int
+	PrefixTerm int
+	LeaderCommit int
+	Suffix []Logs
+}
+
+type AppendEntriesReply struct {
+	FollowerId int
+	FollowerTerm int
+	AckedLength int
+	IsSuccess bool
+}
+
+func (rf *Raft) addLogs(prefixLen int, leaderCommit int, suffix []Logs) {
+	//heartbeat - no logs to add
+	//fmt.Println("At ", rf.me, " addlogs ", " prefixLen: ", prefixLen, " suffix: ", len(suffix))
+	/*var index int
+	if (len(suffix) > 0 && len(rf.log) > prefixLen) {
+		if (len(rf.log) < prefixLen + len(suffix)){
+			index = len(rf.log) -1
+		} else {
+			index = prefixLen + len(suffix) - 1
+		}
+
+		if (rf.log[index].Term != suffix[index-prefixLen].Term ){
+			rf.log = rf.log[:prefixLen]
+		}
+		
+	}
+
+	if prefixLen + len(suffix) > len(rf.log) {
+		for i:= len(rf.log) - prefixLen; i< len(suffix); i++ {
+			rf.log = append(rf.log, suffix[i])
+		}
+	}*/
+	
+	rf.log = rf.log[:prefixLen]
+	for i:= 0 ; i< len(suffix) ; i++ {
+		rf.log = append(rf.log, suffix[i])
+	}
+	rf.persist()
+
+	if leaderCommit > rf.commitLength {
+		for j:= rf.commitLength; j < leaderCommit; j++ {
+			//Deliver log[j]
+			msg := ApplyMsg{}
+			msg.CommandValid = true
+			msg.CommandIndex = j
+			msg.Command = rf.log[j].Command
+			rf.applyCh <- msg
+			rf.commitLength = rf.commitLength + 1
+			rf.persist()
+		}
+		//Below line might be no more needed
+		rf.commitLength = leaderCommit
+	}
+	//Below line might be no more needed
+	rf.persist()
+}
+
+
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+
+	//fmt.Println("At ", rf.me, " appendEntries ", " prefixLen: ", args.PrefixLength, " suffix: ", len(args.Suffix))
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	
+	if args.LeaderTerm > rf.currentTerm {
+		rf.currentTerm = args.LeaderTerm
+		rf.votedFor = -1
+		rf.receivedMsg = true
+		rf.persist()
+	} 
+	if args.LeaderTerm == rf.currentTerm {
+		rf.currentRole = "follower"
+		rf.currentLeader = args.LeaderId
+		rf.receivedMsg = true
+	}
+
+	logOk := ( len(rf.log)>= args.PrefixLength ) && 
+			(args.PrefixLength ==0 || rf.log[args.PrefixLength-1].Term == args.PrefixTerm)
+
+	if (args.LeaderTerm == rf.currentTerm) && logOk {
+		reply.FollowerId = rf.me
+		reply.FollowerTerm = rf.currentTerm
+		rf.addLogs(args.PrefixLength, args.LeaderCommit, args.Suffix)
+		reply.AckedLength = args.PrefixLength + len(args.Suffix)
+		reply.IsSuccess = true
+	} else {
+		reply.FollowerId = rf.me
+		reply.FollowerTerm = rf.currentTerm
+		reply.AckedLength = 0
+		reply.IsSuccess = false
+	}
+
+	return
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -173,6 +374,11 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	return ok
+}
+
 
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
@@ -192,7 +398,17 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (3B).
-
+	term, isLeader = rf.GetState()
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if isLeader {
+		index = len(rf.log)
+		nextLog := Logs{}
+		nextLog.Command = command
+		nextLog.Term = rf.currentTerm
+		rf.log = append(rf.log, nextLog)
+	}
+	
 
 	return index, term, isLeader
 }
@@ -216,20 +432,251 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
+func (rf *Raft) generateSuffix(prefixLen int) []Logs {
+	var suffix []Logs
+
+	var id int
+
+	for id = prefixLen ;id < len(rf.log); id++ {
+		suffix = append(suffix, rf.log[id])
+	}
+
+	return suffix
+}
+
+func (rf *Raft) startElection() {
+
+	
+	args := RequestVoteArgs{}
+	args.CandidateId = rf.me
+	args.CandidateTerm = rf.currentTerm
+
+	//to be added in 3B
+	args.CLogLength = len(rf.log)
+	if (len(rf.log) != 0) {
+		args.CLogTerm = rf.log[len(rf.log)-1].Term
+	} else{
+		args.CLogTerm = 0
+	}
+
+	for i, _ := range rf.peers {
+		
+		if (i != rf.me){
+			go func(x int){
+				reply := RequestVoteReply{}
+				ok := rf.sendRequestVote(x, &args, &reply)
+				
+				//Rethink: if this makes sense - instead we should keep trying to send this and keep a timer of electiontimeout
+				if !ok {
+					return
+				}
+
+				rf.mu.Lock()
+				defer rf.mu.Unlock()
+				
+
+				if rf.currentRole == "candidate" && reply.VCurrentTerm == rf.currentTerm && reply.VoterResponse {
+					rf.votesReceived[reply.VoterId] = true
+
+					if (len(rf.votesReceived) >= (len(rf.peers)+2)/2){
+						//fmt.Println("Leader Alert!")
+						//fmt.Println("current leader: ",rf.me, " at term: ", rf.currentTerm)
+						rf.currentRole = "leader"
+						rf.currentLeader = rf.me
+						
+						for j, _ := range rf.peers{
+							if (j != rf.me) {
+								rf.sentLength[j] = len(rf.log)
+								rf.ackedLength[j] = 1
+								//Rethink: If this args can be taken outside of this go func
+								args := AppendEntriesArgs{}
+								args.LeaderId = rf.me
+								args.LeaderTerm = rf.currentTerm
+								args.PrefixLength = len(rf.log)
+								args.PrefixTerm = 0
+								if args.PrefixLength > 0 {
+									args.PrefixTerm = rf.log[args.PrefixLength - 1].Term
+								}
+								args.Suffix = rf.generateSuffix(args.PrefixLength)
+								go func(y int) {
+									reply := AppendEntriesReply{}
+									rf.sendAppendEntries(y, &args, &reply)
+								}(j)
+							}
+						}
+
+						/*for j, _ := range rf.peers{
+							if (j != rf.me) {
+								rf.sentLength[j] = len(rf.log)
+								rf.ackedLength[j] = 1
+							}
+						}
+
+						////fmt.Println("Initialization of SentLength done")
+						leaderId := rf.me
+						leaderTerm := rf.currentTerm
+						leaderCommit := rf.commitLength
+						rf.mu.Unlock()
+						for j, _ := range rf.peers{
+							if (j != rf.me) {
+								go func(y int) {
+									////fmt.Println("Triggered sending logs to follower")
+									rf.sendLogsToFollower(y, leaderId, leaderTerm, leaderCommit)
+								} (j)
+							}
+						}*/
+
+						return
+					}
+				} else if reply.VCurrentTerm > rf.currentTerm {
+					rf.currentTerm = reply.VCurrentTerm
+					rf.currentRole = "follower"
+					rf.votedFor = -1
+					rf.persist()
+					//rf.mu.Unlock()
+					return
+				} else if rf.currentRole == "leader" {
+					//rf.mu.Unlock()
+					return
+				} else 	{
+					//rf.mu.Unlock()
+					return
+				}
+			} (i)
+		}
+	}
+
+
+}
+
 func (rf *Raft) ticker() {
 	for rf.killed() == false {
 
 		// Your code here (3A)
 		// Check if a leader election should be started.
 
-
-		// pause for a random amount of time between 50 and 350
-		// milliseconds.
-		ms := 50 + (rand.Int63() % 300)
+		//TODO: check if this time makes sense
+		ms := 190 + (rand.Int63() % 100)
 		time.Sleep(time.Duration(ms) * time.Millisecond)
+		rf.mu.Lock()
+		currentRole := rf.currentRole
+
+		if currentRole != "leader" {
+			receivedMsg := rf.receivedMsg
+			if !receivedMsg {
+				rf.currentTerm = rf.currentTerm +1
+				rf.currentRole = "candidate"
+				rf.votedFor = rf.me
+				rf.persist()
+				//clear the set votesReceived
+				for k := range rf.votesReceived {
+					delete(rf.votesReceived, k)
+				}
+				rf.votesReceived[rf.me] = true
+				rf.startElection()
+			} else {
+				rf.receivedMsg = false
+			}
+		}
+		rf.mu.Unlock()
 	}
 }
 
+func (rf *Raft) commitLogs() {
+
+	var acks int
+
+	if rf.currentRole == "leader" {
+		
+		for ; rf.commitLength < len(rf.log); {
+			acks = 1
+			for i, _ := range rf.peers {
+				if i!= rf.me {
+					if rf.ackedLength[i] > rf.commitLength {
+						acks = acks + 1
+					}
+				}
+			}
+
+			if (acks >= (len(rf.peers)+2)/2 ) {
+				msg := ApplyMsg{}
+				msg.CommandValid = true
+				msg.CommandIndex = rf.commitLength
+				msg.Command = rf.log[rf.commitLength].Command
+				rf.applyCh <- msg
+				rf.commitLength = rf.commitLength + 1
+				rf.persist()
+			} else {
+				break;
+			}
+		}
+	}
+}
+
+func (rf* Raft) sendLogsToFollower(x int, leaderId int, leaderTerm int, leaderCommit int){
+	rf.mu.Lock()
+	////fmt.Println("Entered the lock inside sendLogsToFollower")
+	args := AppendEntriesArgs{}
+	args.LeaderId = leaderId
+	args.LeaderTerm = leaderTerm
+	args.LeaderCommit = leaderCommit
+	//fmt.Println("For ",x , " sentLength: ", rf.sentLength[x] )
+	args.PrefixLength = rf.sentLength[x]
+	args.PrefixTerm = 0
+	if args.PrefixLength > 0 {
+		args.PrefixTerm = rf.log[args.PrefixLength - 1].Term
+	}
+	args.Suffix = rf.generateSuffix(args.PrefixLength)
+	reply := AppendEntriesReply{}
+	rf.mu.Unlock()
+	ok := rf.sendAppendEntries(x, &args, &reply)
+	if !ok {
+		return
+	}
+	
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if reply.FollowerTerm == rf.currentTerm && rf.currentRole == "leader"{
+		if reply.IsSuccess == true && reply.AckedLength > rf.ackedLength[x]{
+			rf.sentLength[x] = reply.AckedLength
+			rf.ackedLength[x] = reply.AckedLength
+			rf.commitLogs()
+		} else if rf.sentLength[x]>0 {
+			rf.sentLength[x] = rf.sentLength[x] -1
+			args.PrefixLength = rf.sentLength[x]
+			args.Suffix = rf.generateSuffix(args.PrefixLength)
+			_ = rf.sendAppendEntries(x, &args, &reply)
+		}
+	} else if reply.FollowerTerm > rf.currentTerm && rf.currentRole == "leader" {
+		rf.currentTerm = reply.FollowerTerm
+		rf.currentRole = "follower"
+		rf.votedFor = -1
+		rf.persist()
+	}
+}
+
+func (rf* Raft) sendLeaderLogs() {
+
+	for rf.killed() == false {
+		_, leader := rf.GetState()
+		if leader {
+			rf.mu.Lock()
+			leaderId := rf.me
+			leaderTerm := rf.currentTerm
+			leaderCommit := rf.commitLength
+			rf.mu.Unlock()
+			for i, _ := range rf.peers {
+				if (i!= rf.me) {
+					go func(x int) {
+						rf.sendLogsToFollower(x, leaderId, leaderTerm, leaderCommit)		
+					} (i)
+				}
+			}
+		}
+
+		time.Sleep(100 * time.Millisecond)
+	}
+}
 // the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
 // server's port is peers[me]. all the servers' peers[] arrays
@@ -247,12 +694,37 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (3A, 3B, 3C).
+	
+	rf.currentRole = "follower"
+	rf.currentLeader = -1
+	rf.votesReceived = make(map[int]bool)
+
+	rf.currentTerm = 0
+	rf.receivedMsg = false
+	
+	rf.votedFor = -1
+
+	rf.applyCh = applyCh
+
+	rf.commitLength = 1
+	initLog := Logs{}
+	initLog.Term = 0
+	rf.log = []Logs{initLog}
+
+	//initializing sentLength & ackLength
+	for i:=0; i< len(rf.peers) ; i++ {
+		rf.sentLength = append(rf.sentLength, 0)
+		rf.ackedLength = append(rf.ackedLength, 0)
+	}
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
+
+	// start leader logs goroutine to notify followers
+	go rf.sendLeaderLogs()
 
 
 	return rf

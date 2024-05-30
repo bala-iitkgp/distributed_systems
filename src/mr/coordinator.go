@@ -11,11 +11,6 @@ import "strconv"
 //import "fmt"
 import "strings"
 
-type Coordinator struct {
-	// Your definitions here.
-
-}
-
 
 type TaskDetails struct {
 
@@ -25,17 +20,21 @@ type TaskDetails struct {
 
 }
 
-// variables
+type Coordinator struct {
+	// State definitions of coordinator here.
+	NMapJobs int
+	NMapJobsDone int
+	NReduceJobs int
+	NReduceJobsDone int
+	StatusLock sync.Mutex
+	Tasks map[string]TaskDetails
+	WaitingTaskSet map[string]bool
+	ReadyTaskSet map[string]bool
+	InProgressTaskSet map[string]bool
+}
 
-var NMapJobs, NMapJobsDone, NReduceJobs, NReduceJobsDone int
 
-var TaskLock, StatusLock sync.Mutex
-
-var Tasks map[string]TaskDetails
-
-var WaitingTaskSet, ReadyTaskSet, InProgressTaskSet map[string]bool
-
-// Your code here -- RPC handlers for the worker to call.
+// RPC handlers for the worker to call.
 
 //
 // an example RPC handler.
@@ -52,133 +51,92 @@ func (c *Coordinator) AssignTask(args *AssignTaskInput, reply *AssignTaskOutput)
 
 
 	//Assign any yet-to-be-scheduled map task
-	//fmt.Println("Got a request asking for a task")
-	StatusLock.Lock()
-	TaskLock.Lock()
-	var isLocked bool = true
-	for k,_ := range ReadyTaskSet {
+	c.StatusLock.Lock()
+	defer c.StatusLock.Unlock()
+
+	for k,_ := range c.ReadyTaskSet {
 		
 		reply.TaskId = k
-		reply.InputFiles = Tasks[k].InputFiles
-		reply.NReduce = NReduceJobs
+		reply.InputFiles = c.Tasks[k].InputFiles
+		reply.NReduce = c.NReduceJobs
 
-		delete(ReadyTaskSet, k)
-		InProgressTaskSet[k] = true
+		delete(c.ReadyTaskSet, k)
+		c.InProgressTaskSet[k] = true
 	
-		Tasks[k] = TaskDetails{time.Now(), Tasks[k].InputFiles, Tasks[k].OutputFiles}
-		StatusLock.Unlock()
-		TaskLock.Unlock()
-		isLocked = false
+		c.Tasks[k] = TaskDetails{time.Now(), c.Tasks[k].InputFiles, c.Tasks[k].OutputFiles}
 		return nil
 		
 	}
-	if (isLocked) {
-		StatusLock.Unlock()
-		TaskLock.Unlock()
-	}
+
 	//Assign any yet-to-be-scheduled reduce task
-
-	StatusLock.Lock()
-	isLocked = true
-	if (NMapJobs == NMapJobsDone) {
-		for k,_ := range WaitingTaskSet {
-			
-			TaskLock.Lock()
+	if (c.NMapJobs == c.NMapJobsDone) {
+		for k,_ := range c.WaitingTaskSet {
 			reply.TaskId = k
-			reply.InputFiles = Tasks[k].InputFiles
-			reply.NReduce = NReduceJobs
+			reply.InputFiles = c.Tasks[k].InputFiles
+			reply.NReduce = c.NReduceJobs
 
-			delete(WaitingTaskSet, k)
-			InProgressTaskSet[k] = true
+			delete(c.WaitingTaskSet, k)
+			c.InProgressTaskSet[k] = true
 		
-			Tasks[k] = TaskDetails{time.Now(), Tasks[k].InputFiles, Tasks[k].OutputFiles}
-			TaskLock.Unlock()
-			StatusLock.Unlock()
-			isLocked = false
+			c.Tasks[k] = TaskDetails{time.Now(), c.Tasks[k].InputFiles, c.Tasks[k].OutputFiles}
 			return nil
 
 		}
 	}
-	if (isLocked) {
-		StatusLock.Unlock()
-	}
-	
 
 	//If there is no such task available, assign an already scheduled task
 	//which is taking long time & Update time of that task
 
 	currTime := time.Now()
-	StatusLock.Lock()
-	TaskLock.Lock()
-	isLocked = true
-	for k,_ := range InProgressTaskSet {
+	for k,_ := range c.InProgressTaskSet {
 		
-		scheduledTime := Tasks[k].StartTime
+		scheduledTime := c.Tasks[k].StartTime
 		if (currTime.Sub(scheduledTime).Seconds() > 10) {
 
-			Tasks[k] = TaskDetails{time.Now(), Tasks[k].InputFiles, Tasks[k].OutputFiles}
-			
+			c.Tasks[k] = TaskDetails{time.Now(), c.Tasks[k].InputFiles, c.Tasks[k].OutputFiles}	
 			reply.TaskId = k
-			reply.InputFiles = Tasks[k].InputFiles
-			reply.NReduce = NReduceJobs
-
-			TaskLock.Unlock()
-			StatusLock.Unlock()
-			isLocked = false
+			reply.InputFiles = c.Tasks[k].InputFiles
+			reply.NReduce = c.NReduceJobs
 			return nil
 		}
 	}
-	if (isLocked) {
-		StatusLock.Unlock()
-		TaskLock.Unlock()
-	}
-	
+
 	reply.TaskId = "no-task"
 	reply.InputFiles =[]string{""}
-	reply.NReduce = NReduceJobs
+	reply.NReduce = c.NReduceJobs
 
 	return nil
 }
 
 func (c *Coordinator) CompletedTask(args *CompletedTaskInput, reply *CompletedTaskOutput) error {
 
-	//fmt.Println("Some worker completed their task")
 	taskId := args.TaskId
 	outputFiles := args.OutputFiles
 
-	
-
-	StatusLock.Lock()
-	_,ok := InProgressTaskSet[taskId]
+	c.StatusLock.Lock()
+	defer c.StatusLock.Unlock()
+	_,ok := c.InProgressTaskSet[taskId]
 	if ok {
 		if(strings.HasPrefix(taskId, "m-")) {
-			NMapJobsDone = NMapJobsDone + 1
+			c.NMapJobsDone = c.NMapJobsDone + 1
 		} else if( strings.HasPrefix(taskId, "r-")) {
-			NReduceJobsDone = NReduceJobsDone + 1
+			c.NReduceJobsDone = c.NReduceJobsDone + 1
 		}
-		//fmt.Println("Status of Jobs Done") 
-		//fmt.Println("... MapJobs : ", NMapJobsDone, " out of ", NMapJobs)
-		//fmt.Println("... ReduceJobs : ", NReduceJobsDone, " out of ", NReduceJobs)
-		delete(InProgressTaskSet, taskId)
+		delete(c.InProgressTaskSet, taskId)
 	}
-	StatusLock.Unlock()
 
 	var reduceTask string
 	if ok {
-		TaskLock.Lock()
-		Tasks[taskId] = TaskDetails{Tasks[taskId].StartTime, Tasks[taskId].InputFiles, outputFiles}
-
+		c.Tasks[taskId] = TaskDetails{c.Tasks[taskId].StartTime, c.Tasks[taskId].InputFiles, outputFiles}
 		// if this task is Map worker - update inputs of Reduce workers
 		if(strings.HasPrefix(taskId, "m-")) {
 			for i,v := range outputFiles {
 				// this assumes the output files of each map are in order of the ReduceJobs
 				reduceTask = "r-" + strconv.Itoa(i)
-				Tasks[reduceTask] = TaskDetails{Tasks[reduceTask].StartTime,
-												append(Tasks[reduceTask].InputFiles, v), Tasks[reduceTask].OutputFiles}
+				c.Tasks[reduceTask] = TaskDetails{c.Tasks[reduceTask].StartTime,
+												append(c.Tasks[reduceTask].InputFiles, v), c.Tasks[reduceTask].OutputFiles}
 			}
 		}
-
-		TaskLock.Unlock()
 		reply.Ack = "Thanks"
 	} else {
 		reply.Ack = "Already Done. Thanks anyway"
@@ -212,48 +170,48 @@ func (c *Coordinator) server() {
 func (c *Coordinator) Done() bool {
 	ret := false
 
-	// Your code here.
 	// checks JobStatus and updates ret if job is done
-	StatusLock.Lock()
-	if (NMapJobs == NMapJobsDone && NReduceJobs == NReduceJobsDone) {
+	c.StatusLock.Lock()
+	defer c.StatusLock.Unlock()
+	if (c.NMapJobs == c.NMapJobsDone && c.NReduceJobs == c.NReduceJobsDone) {
 		ret = true
 	}
-	StatusLock.Unlock()
+	
 
 	return ret
 }
 
-func Init(files []string, nReduce int) {
+func(c *Coordinator) Init(files []string, nReduce int) {
 
-	NMapJobs = len(files)
-	NReduceJobs = nReduce
-	NMapJobsDone = 0
-	NReduceJobsDone = 0
+	c.NMapJobs = len(files)
+	c.NReduceJobs = nReduce
+	c.NMapJobsDone = 0
+	c.NReduceJobsDone = 0
 
-	Tasks = make(map[string]TaskDetails)
-	ReadyTaskSet = make(map[string]bool)
-	WaitingTaskSet = make(map[string]bool)
-	InProgressTaskSet = make(map[string]bool)
+	c.Tasks = make(map[string]TaskDetails)
+	c.ReadyTaskSet = make(map[string]bool)
+	c.WaitingTaskSet = make(map[string]bool)
+	c.InProgressTaskSet = make(map[string]bool)
 
 	var taskId string
 	mapPrefix := "m-"
 	reducePrefix := "r-"
 
 	var i int
-	for i =0; i<NMapJobs; i++ {
+	for i =0; i<c.NMapJobs; i++ {
 		taskId = mapPrefix + strconv.Itoa(i)
 
-		Tasks[taskId] = TaskDetails{time.Now(), []string{files[i]}, []string{} }
+		c.Tasks[taskId] = TaskDetails{time.Now(), []string{files[i]}, []string{} }
 
-		ReadyTaskSet[taskId] = true
+		c.ReadyTaskSet[taskId] = true
 	}
 
 	for i =0; i<nReduce; i++ {
 		taskId = reducePrefix + strconv.Itoa(i)
 
-		Tasks[taskId] = TaskDetails{time.Now(), []string{}, []string{}}
+		c.Tasks[taskId] = TaskDetails{time.Now(), []string{}, []string{}}
 
-		WaitingTaskSet[taskId] = true
+		c.WaitingTaskSet[taskId] = true
 	}
 
 }
@@ -265,9 +223,8 @@ func Init(files []string, nReduce int) {
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	c := Coordinator{}
 
-	// Your code here.
-	Init(files, nReduce)
-
+	c.Init(files, nReduce)
 	c.server()
+
 	return &c
 }

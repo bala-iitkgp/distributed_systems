@@ -162,7 +162,7 @@ func (rf *Raft) readPersist(data []byte) {
 	   d.Decode(&votedFor) != nil ||
 	   d.Decode(&log) != nil ||
 	   d.Decode(&commitLength) != nil ) {
-		//fmt.Println("Decode Error!!")	
+		////fmt.Println("Decode Error!!")	
 	} else {
 		rf.currentTerm = currentTerm
 		rf.votedFor = votedFor
@@ -255,31 +255,13 @@ type AppendEntriesReply struct {
 	FollowerTerm int
 	AckedLength int
 	IsSuccess bool
+	XTerm int
+	XIndex int
+	XLen int
 }
 
 func (rf *Raft) addLogs(prefixLen int, leaderCommit int, suffix []Logs) {
-	//heartbeat - no logs to add
-	//fmt.Println("At ", rf.me, " addlogs ", " prefixLen: ", prefixLen, " suffix: ", len(suffix))
-	/*var index int
-	if (len(suffix) > 0 && len(rf.log) > prefixLen) {
-		if (len(rf.log) < prefixLen + len(suffix)){
-			index = len(rf.log) -1
-		} else {
-			index = prefixLen + len(suffix) - 1
-		}
 
-		if (rf.log[index].Term != suffix[index-prefixLen].Term ){
-			rf.log = rf.log[:prefixLen]
-		}
-		
-	}
-
-	if prefixLen + len(suffix) > len(rf.log) {
-		for i:= len(rf.log) - prefixLen; i< len(suffix); i++ {
-			rf.log = append(rf.log, suffix[i])
-		}
-	}*/
-	
 	rf.log = rf.log[:prefixLen]
 	for i:= 0 ; i< len(suffix) ; i++ {
 		rf.log = append(rf.log, suffix[i])
@@ -297,13 +279,18 @@ func (rf *Raft) addLogs(prefixLen int, leaderCommit int, suffix []Logs) {
 			rf.commitLength = rf.commitLength + 1
 			rf.persist()
 		}
-		//Below line might be no more needed
 		rf.commitLength = leaderCommit
 	}
-	//Below line might be no more needed
 	rf.persist()
 }
 
+func (rf *Raft) findXIndex(prefixLen int) int {
+	var xIndex = prefixLen - 1
+	for ; xIndex > 0 && rf.log[xIndex -1].Term == rf.log[prefixLen -1].Term ; xIndex-- {
+
+	}
+	return xIndex
+}
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 
@@ -325,7 +312,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	logOk := ( len(rf.log)>= args.PrefixLength ) && 
 			(args.PrefixLength ==0 || rf.log[args.PrefixLength-1].Term == args.PrefixTerm)
-
+	//fmt.Println("logOk: ", logOk, " len of rf.log ", len(rf.log), " prefixLength: ",args.PrefixLength)
 	if (args.LeaderTerm == rf.currentTerm) && logOk {
 		reply.FollowerId = rf.me
 		reply.FollowerTerm = rf.currentTerm
@@ -337,6 +324,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.FollowerTerm = rf.currentTerm
 		reply.AckedLength = 0
 		reply.IsSuccess = false
+		if(len(rf.log)>=args.PrefixLength){
+			reply.XTerm = rf.log[args.PrefixLength-1].Term
+			reply.XIndex = rf.findXIndex(args.PrefixLength)
+		} else{
+			reply.XTerm = -1
+		}
+		reply.XLen = len(rf.log)
 	}
 
 	return
@@ -446,7 +440,7 @@ func (rf *Raft) generateSuffix(prefixLen int) []Logs {
 
 func (rf *Raft) startElection() {
 
-	
+	//fmt.Println("An election is being started")
 	args := RequestVoteArgs{}
 	args.CandidateId = rf.me
 	args.CandidateTerm = rf.currentTerm
@@ -505,27 +499,6 @@ func (rf *Raft) startElection() {
 							}
 						}
 
-						/*for j, _ := range rf.peers{
-							if (j != rf.me) {
-								rf.sentLength[j] = len(rf.log)
-								rf.ackedLength[j] = 1
-							}
-						}
-
-						////fmt.Println("Initialization of SentLength done")
-						leaderId := rf.me
-						leaderTerm := rf.currentTerm
-						leaderCommit := rf.commitLength
-						rf.mu.Unlock()
-						for j, _ := range rf.peers{
-							if (j != rf.me) {
-								go func(y int) {
-									////fmt.Println("Triggered sending logs to follower")
-									rf.sendLogsToFollower(y, leaderId, leaderTerm, leaderCommit)
-								} (j)
-							}
-						}*/
-
 						return
 					}
 				} else if reply.VCurrentTerm > rf.currentTerm {
@@ -533,13 +506,10 @@ func (rf *Raft) startElection() {
 					rf.currentRole = "follower"
 					rf.votedFor = -1
 					rf.persist()
-					//rf.mu.Unlock()
 					return
 				} else if rf.currentRole == "leader" {
-					//rf.mu.Unlock()
 					return
 				} else 	{
-					//rf.mu.Unlock()
 					return
 				}
 			} (i)
@@ -613,9 +583,23 @@ func (rf *Raft) commitLogs() {
 	}
 }
 
+func (rf* Raft) findLastIndexOfXTerm(xTerm int) int {
+	lastIndex := len(rf.log)
+
+	for ;lastIndex > 0 && rf.log[lastIndex-1].Term > xTerm; lastIndex-- {}
+
+	if (lastIndex <0) {
+		return 0
+	} else if(rf.log[lastIndex-1].Term == xTerm) {
+		return lastIndex
+	} else {
+		return -1;
+	}
+}
+
 func (rf* Raft) sendLogsToFollower(x int, leaderId int, leaderTerm int, leaderCommit int){
 	rf.mu.Lock()
-	////fmt.Println("Entered the lock inside sendLogsToFollower")
+	//fmt.Println("Sending logs to follower: ", x, " by leader: ", leaderId)
 	args := AppendEntriesArgs{}
 	args.LeaderId = leaderId
 	args.LeaderTerm = leaderTerm
@@ -637,12 +621,22 @@ func (rf* Raft) sendLogsToFollower(x int, leaderId int, leaderTerm int, leaderCo
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	if reply.FollowerTerm == rf.currentTerm && rf.currentRole == "leader"{
-		if reply.IsSuccess == true && reply.AckedLength > rf.ackedLength[x]{
+		if reply.IsSuccess == true {
 			rf.sentLength[x] = reply.AckedLength
 			rf.ackedLength[x] = reply.AckedLength
 			rf.commitLogs()
-		} else if rf.sentLength[x]>0 {
-			rf.sentLength[x] = rf.sentLength[x] -1
+		} else if rf.sentLength[x] > 0 {
+			if reply.XTerm == -1 {
+				rf.sentLength[x] = reply.XLen
+			} else {
+				//rf.sentLength[x] = rf.sentLength[x] -1
+				lastIndex := rf.findLastIndexOfXTerm(reply.XTerm)
+				if lastIndex == -1 {
+					rf.sentLength[x] = reply.XIndex
+				} else {
+					rf.sentLength[x] = lastIndex
+				}
+			}
 			args.PrefixLength = rf.sentLength[x]
 			args.Suffix = rf.generateSuffix(args.PrefixLength)
 			_ = rf.sendAppendEntries(x, &args, &reply)
